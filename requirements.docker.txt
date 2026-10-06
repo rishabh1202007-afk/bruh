@@ -1,0 +1,5 @@
+# Linux-compatible dependencies needed by the Docker foundation.
+# pywin32 remains in requirements.txt for the Windows event ingestor and
+# is intentionally excluded from this Linux container image.
+mysql-connector-python==8.0.30
+openai==3.24.0

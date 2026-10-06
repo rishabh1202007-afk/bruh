@@ -2,13 +2,18 @@ from __future__ import annotations
 
 import importlib
 import re
-from typing import Any, Dict, List, Set
+from typing import Any, Dict, Iterable, List, Set
 
 from ..fact_packet.builder import canonical_mitre_techniques
+from .attack_sequence import reconstruct_attack_sequence
+from .evidence_gap_engine import analyze_evidence_gaps
+from .historical_comparison import compare_historical_incidents
 from .guardrails import (
     run_guardrails,
     validate_response_grounding,
 )
+from .risk_explanation import explain_risk_score
+from .recommendation_engine import RecommendationEngine
 
 from .models import (
     EvidenceClaim,
@@ -772,6 +777,10 @@ class InvestigationAgent:
     def investigate(
         self,
         fact_packet: Dict[str, Any],
+        historical_fact_packets: Iterable[Dict[str, Any]] | None = None,
+        include_attack_sequence: bool = False,
+        graph: Any = None,
+        include_risk_explanation: bool = False,
     ) -> InvestigationResponse:
         """
         Investigate one canonical SentinelMesh Fact Packet.
@@ -801,6 +810,24 @@ class InvestigationAgent:
             or "UNKNOWN"
         )
 
+        historical_comparison = (
+            self._build_historical_comparison(
+                fact_packet,
+                historical_fact_packets,
+            )
+        )
+
+        attack_sequence = self._build_attack_sequence(
+            fact_packet,
+            include_attack_sequence,
+            graph,
+        )
+
+        risk_explanation = self._build_risk_explanation(
+            fact_packet,
+            include_risk_explanation,
+        )
+
         if not guardrail_result[
             "safe_to_investigate"
         ]:
@@ -817,6 +844,9 @@ class InvestigationAgent:
                 ],
                 grounded=True,
                 insufficient_evidence=True,
+                historical_comparison=historical_comparison,
+                attack_sequence=attack_sequence,
+                risk_explanation=risk_explanation,
             )
 
         # ---------------------------------------------------------
@@ -858,6 +888,9 @@ class InvestigationAgent:
                 ],
                 grounded=True,
                 insufficient_evidence=True,
+                historical_comparison=historical_comparison,
+                attack_sequence=attack_sequence,
+                risk_explanation=risk_explanation,
             )
 
         observed = _observed_facts(
@@ -926,6 +959,9 @@ class InvestigationAgent:
             ],
             grounded=True,
             insufficient_evidence=insufficient,
+            historical_comparison=historical_comparison,
+            attack_sequence=attack_sequence,
+            risk_explanation=risk_explanation,
         )
 
         grounding_warnings = (
@@ -954,6 +990,111 @@ class InvestigationAgent:
             response.insufficient_evidence = True
 
         return response
+
+    @staticmethod
+    def _build_risk_explanation(
+        fact_packet: Dict[str, Any],
+        include_risk_explanation: bool,
+    ) -> Dict[str, Any] | None:
+        """Explain deterministic risk output without changing it."""
+
+        if not include_risk_explanation:
+            return None
+
+        try:
+            return explain_risk_score(
+                fact_packet
+            ).to_dict()
+        except Exception:
+            return {
+                "incident_id": "",
+                "status": "insufficient_evidence",
+                "risk_score": None,
+                "risk_level": None,
+                "model_version": None,
+                "top_contributing_factors": [],
+                "factor_explanations": [],
+                "supporting_evidence_refs": [],
+                "observed_risk_signals": [],
+                "limitations": [
+                    "Risk explanation was unavailable; the normal "
+                    "investigation result was preserved."
+                ],
+                "attribution_warning": None,
+                "grounded": True,
+                "insufficient_evidence": True,
+            }
+
+    @staticmethod
+    def _build_attack_sequence(
+        fact_packet: Dict[str, Any],
+        include_attack_sequence: bool,
+        graph: Any,
+    ) -> Dict[str, Any] | None:
+        """Run optional deterministic reconstruction safely."""
+
+        if not include_attack_sequence:
+            return None
+
+        try:
+            return reconstruct_attack_sequence(
+                fact_packet=fact_packet,
+                graph=graph,
+            ).to_dict()
+        except Exception:
+            return {
+                "incident_id": "",
+                "status": "insufficient_evidence",
+                "steps": [],
+                "limitations": [
+                    "Attack sequence reconstruction was unavailable; "
+                    "the normal investigation result was preserved."
+                ],
+                "grounded": True,
+                "insufficient_evidence": True,
+            }
+
+    @staticmethod
+    def _build_historical_comparison(
+        fact_packet: Dict[str, Any],
+        historical_fact_packets: Iterable[Dict[str, Any]] | None,
+    ) -> Dict[str, Any] | None:
+        """Run optional comparison without affecting investigation safety."""
+
+        if historical_fact_packets is None:
+            return None
+
+        try:
+            return compare_historical_incidents(
+                current_fact_packet=fact_packet,
+                historical_fact_packets=historical_fact_packets,
+            ).to_dict()
+        except Exception:
+            return {
+                "status": "insufficient_evidence",
+                "current_incident_id": (
+                    str(
+                        fact_packet.get(
+                            "incident",
+                            {},
+                        ).get(
+                            "incident_id",
+                            "",
+                        )
+                    )
+                    if isinstance(
+                        fact_packet.get("incident"),
+                        dict,
+                    )
+                    else ""
+                ),
+                "comparisons": [],
+                "limitations": [
+                    "Historical comparison was unavailable; the "
+                    "normal investigation result was preserved."
+                ],
+                "insufficient_evidence": True,
+            }
 
     def _build_summary(
         self,
@@ -1079,154 +1220,33 @@ class InvestigationAgent:
         fact_packet: Dict[str, Any],
     ) -> List[str]:
         """
-        Identify useful investigation data that is missing.
+        Return deterministic evidence gaps from the shared gap engine.
         """
 
-        gaps: List[str] = []
+        analysis = analyze_evidence_gaps(
+            fact_packet
+        )
 
-        if not fact_packet.get(
-            "events"
-        ):
-
-            gaps.append(
-                "Source events are not present "
-                "in the Fact Packet."
-            )
-
-        entities = fact_packet.get(
-            "entities",
-            {},
-        ) or {}
-
-        if not entities.get(
-            "users"
-        ):
-
-            gaps.append(
-                "No user entity is available "
-                "for attribution analysis."
-            )
-
-        if not entities.get(
-            "processes"
-        ):
-
-            gaps.append(
-                "No process entity is available "
-                "for process-level investigation."
-            )
-
-        if not entities.get(
-            "ips"
-        ):
-
-            gaps.append(
-                "No IP entity is available "
-                "for network correlation."
-            )
-
-        return gaps
+        return analysis.gap_messages()
 
     def _build_next_steps(
         self,
         fact_packet: Dict[str, Any],
     ) -> List[InvestigationStep]:
         """
-        Generate investigation recommendations.
-
-        These are recommendations only and are never represented
-        as completed actions.
+        Generate investigation recommendations using the RecommendationEngine.
         """
 
-        detection_refs = [
-            _evidence_ref(
-                item,
-                f"detections[{index}]",
-            )
-            for index, item in enumerate(
-                fact_packet.get(
-                    "detections",
-                    [],
-                )
-                or []
-            )
-            if isinstance(
-                item,
-                dict,
-            )
-        ]
-
-        steps = [
-            InvestigationStep(
-                action=(
-                    "Review the source Windows Security "
-                    "events surrounding the correlated detections."
-                ),
-                rationale=(
-                    "The Fact Packet contains correlated "
-                    "detections but may not contain the "
-                    "full surrounding event context."
-                ),
-                supporting_evidence_refs=detection_refs,
-            ),
-            InvestigationStep(
-                action=(
-                    "Validate whether the observed activity "
-                    "matches expected administrative behavior."
-                ),
-                rationale=(
-                    "The deterministic correlation signal "
-                    "requires analyst context before a "
-                    "malicious conclusion is made."
-                ),
-                supporting_evidence_refs=detection_refs,
-            ),
-        ]
-
-        if fact_packet.get(
-            "behaviors"
-        ):
-
-            behavior_refs = [
-                _evidence_ref(
-                    item,
-                    f"behaviors[{index}]",
-                )
-                for index, item in enumerate(
-                    fact_packet.get(
-                        "behaviors",
-                        [],
-                    )
-                    or []
-                )
-                if isinstance(
-                    item,
-                    dict,
-                )
-            ]
-
-            steps.append(
-                InvestigationStep(
-                    action=(
-                        "Inspect the process and host "
-                        "context associated with the "
-                        "behavior telemetry."
-                    ),
-                    rationale=(
-                        "Behavior telemetry provides "
-                        "indicators but does not independently "
-                        "establish attribution."
-                    ),
-                    supporting_evidence_refs=behavior_refs,
-                )
-            )
-
-        return steps
+        return RecommendationEngine().recommend(fact_packet)
 
 
 def investigate(
     fact_packet: Dict[str, Any],
     top_k: int = 5,
+    historical_fact_packets: Iterable[Dict[str, Any]] | None = None,
+    include_attack_sequence: bool = False,
+    graph: Any = None,
+    include_risk_explanation: bool = False,
 ) -> InvestigationResponse:
     """
     Convenience function for the SentinelMesh AI investigation API.
@@ -1235,7 +1255,11 @@ def investigate(
     return InvestigationAgent(
         top_k=top_k
     ).investigate(
-        fact_packet
+        fact_packet,
+        historical_fact_packets=historical_fact_packets,
+        include_attack_sequence=include_attack_sequence,
+        graph=graph,
+        include_risk_explanation=include_risk_explanation,
     )
 
 

@@ -183,9 +183,53 @@ def test_synthetic_gap_is_preserved_as_warning():
     )
 
 
+def test_blocking_gap_overrides_validation_failure():
+    class InvalidJSONInvestigator:
+        def investigate(self, **_kwargs):
+            return LLMResponse(
+                text="not valid json",
+                model="test-model",
+                provider="fake",
+                request_id="fake-request-002",
+                metadata={},
+            )
+
+    svc = StructuredLLMInvestigator(
+        investigator=InvalidJSONInvestigator()
+    )
+
+    packet = {
+        "incident": {
+            "incident_id": "INC-GAP-004"
+        },
+        "detections": [
+            {
+                "detection_id": "SM-003",
+                "rule_name": (
+                    "Credential Manager Activity"
+                ),
+            }
+        ],
+        "events": [],
+        "behaviors": [],
+        "behavior_detections": [],
+        "evidence": [],
+    }
+
+    result = svc.investigate(packet)
+
+    assert result.status == "insufficient_evidence"
+    assert result.insufficient_evidence is True
+    assert any(
+        "Raw Windows event records" in gap
+        for gap in result.evidence_gaps
+    )
+
+
 if __name__ == "__main__":
     test_blocking_gap_forces_insufficient_evidence()
     test_nonblocking_gap_does_not_force_insufficient_evidence()
     test_synthetic_gap_is_preserved_as_warning()
+    test_blocking_gap_overrides_validation_failure()
 
-    print("3 passed")
+    print("4 passed")

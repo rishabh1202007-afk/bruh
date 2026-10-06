@@ -38,7 +38,10 @@ class InvestigationStep:
 
     action: str
     rationale: str = ""
+    priority: str = "medium"
     supporting_evidence_refs: List[str] = field(default_factory=list)
+    mitre_refs: List[str] = field(default_factory=list)
+    evidence_gap_refs: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -78,6 +81,17 @@ class InvestigationResponse:
     grounded: bool = True
 
     insufficient_evidence: bool = False
+
+    visibility_score: int | None = None
+
+    historical_comparison: Dict[str, Any] | None = None
+
+    attack_sequence: Dict[str, Any] | None = None
+
+    risk_explanation: Dict[str, Any] | None = None
+
+    nlp_risk_explanation: Dict[str, Any] | None = None
+    mitre_investigation: Dict[str, Any] | None = None
 
     def to_dict(self) -> Dict[str, Any]:
         """

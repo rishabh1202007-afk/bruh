@@ -1,0 +1,17 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+COPY requirements.docker.txt ./
+RUN python -m pip install --no-cache-dir -r requirements.docker.txt
+
+COPY main.py ./main.py
+COPY config ./config
+COPY src ./src
+
+# There is no HTTP Python backend yet. This invokes the existing
+# idempotent database initializer without changing application behavior.
+CMD ["python", "-m", "src.storage.incident_store"]
