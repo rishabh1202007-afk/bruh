@@ -1,0 +1,47 @@
+{
+    "threat_profiles": {
+        "SocGholish": {
+            "display_name": "SocGholish",
+            "description": "Behavioral profile for detecting telemetry associated with SocGholish-style activity.",
+            "behaviors": [
+                "suspicious_process_execution",
+                "script_execution",
+                "network_activity",
+                "payload_delivery_indicator"
+            ]
+        },
+
+        "Botnet": {
+            "display_name": "Botnet",
+            "description": "Generic botnet behavioral profile focused on command-and-control and repeated network activity.",
+            "behaviors": [
+                "repeated_outbound_connections",
+                "command_and_control_indicator",
+                "periodic_network_activity",
+                "suspicious_process_execution"
+            ]
+        },
+
+        "GlassWorm": {
+            "display_name": "GlassWorm",
+            "description": "Behavioral profile for detecting telemetry associated with GlassWorm-style activity.",
+            "behaviors": [
+                "credential_access_indicator",
+                "browser_data_access",
+                "persistence_indicator",
+                "network_activity"
+            ]
+        },
+
+        "LemonDuck": {
+            "display_name": "LemonDuck",
+            "description": "Behavioral profile for detecting telemetry associated with LemonDuck-style activity.",
+            "behaviors": [
+                "suspicious_process_execution",
+                "persistence_indicator",
+                "network_activity",
+                "privilege_indicator"
+            ]
+        }
+    }
+}

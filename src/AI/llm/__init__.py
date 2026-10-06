@@ -1,0 +1,3 @@
+"""
+SentinelMesh LLM integration layer.
+"""

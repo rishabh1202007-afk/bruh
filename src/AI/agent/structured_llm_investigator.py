@@ -1,0 +1,1137 @@
+import json
+import re
+from typing import Any, Dict, Iterable, List, Set
+
+from ..llm.models import LLMResponse
+from .evidence_gap_engine import (
+    EvidenceGapAnalysis,
+    EvidenceGapEngine,
+    analyze_evidence_gaps,
+)
+from .evidence_validator import (
+    assert_valid_investigation_response,
+)
+from .investigation_agent import InvestigationResponse
+from .llm_investigator import LLMInvestigator
+
+
+STRUCTURED_RESPONSE_INSTRUCTION = """
+Return the investigation result as STRICT JSON.
+
+Do not use Markdown.
+Do not use code fences.
+Do not add any text before or after the JSON.
+
+The JSON object MUST contain exactly these fields:
+
+{
+  "status": "investigating",
+  "summary": "string",
+  "observed_facts": [
+    {
+      "claim": "string",
+      "evidence_refs": ["string"],
+      "source": "fact_packet"
+    }
+  ],
+  "knowledge_context": [
+    {
+      "statement": "string",
+      "knowledge_refs": ["string"],
+      "source": "rag"
+    }
+  ],
+  "uncertainties": ["string"],
+  "evidence_gaps": ["string"],
+  "next_investigation_steps": [
+    {
+      "action": "string",
+      "rationale": "string",
+      "supporting_evidence_refs": ["string"]
+    }
+  ],
+  "safety_warnings": ["string"],
+  "grounded": true,
+  "insufficient_evidence": false
+}
+
+STRICT RULES:
+
+1. Every factual claim in observed_facts MUST have at least one
+   evidence reference from the supplied Fact Packet.
+
+2. Evidence references are opaque identifiers. Use ONLY exact reference
+   strings from the ALLOWED FACT PACKET REFERENCES section supplied below.
+   Never create, transform, abbreviate, prefix, or paraphrase a reference.
+
+3. For observed_facts, evidence_refs MUST contain only allowed Fact Packet
+   references. If a fact cannot be supported by an allowed reference, do not
+   include that fact.
+
+4. For next_investigation_steps, supporting_evidence_refs MUST also contain
+   only allowed Fact Packet references. If a step has no directly supporting
+   reference, use an empty list rather than inventing one.
+
+5. Knowledge statements may use knowledge_refs ONLY when retrieved RAG
+   context is supplied. Those references must be exact strings from the
+   ALLOWED KNOWLEDGE REFERENCES section. If no RAG references are supplied,
+   return knowledge_context as [].
+
+6. Never invent an event, user, host, IP, process, timestamp, vulnerability,
+   malware family, MITRE technique, or attack stage.
+
+7. Evidence gaps are established by SentinelMesh deterministic
+   analysis, not by the LLM. Use only the gaps listed in
+   DETERMINISTIC EVIDENCE-GAP ANALYSIS. Do not invent additional
+   evidence gaps. You may explain those gaps and recommend next
+   investigation steps. visibility_score is a visibility metric,
+   not a risk score.
+
+8. Do not infer attacker intent from an observed detection unless the
+   supplied evidence explicitly establishes intent.
+
+9. Do not infer that an attack is in an early stage, late stage,
+   reconnaissance stage, or any other attack stage unless the supplied
+   evidence establishes that.
+
+10. Do not convert severity or risk score into an unsupported conclusion.
+
+11. MITRE technique mappings describe observed behavior. They do not prove
+    malware attribution.
+
+12. If threat-profile alignment is present, preserve the supplied
+    attribution status. A behavioral profile match is NOT confirmed
+    malware attribution.
+
+13. Synthetic telemetry must remain explicitly synthetic.
+
+14. Investigation steps may be recommendations, but their rationale must be
+    based on supplied evidence or explicitly identified uncertainty.
+
+15. If the evidence does not support a conclusion, put the limitation in
+    uncertainties or evidence_gaps instead of inventing a conclusion.
+
+16. If there is insufficient evidence to investigate, return:
+
+{
+  "status": "insufficient_evidence",
+  "summary": "Insufficient evidence",
+  "observed_facts": [],
+  "knowledge_context": [],
+  "uncertainties": ["..."],
+  "evidence_gaps": ["..."],
+  "next_investigation_steps": [],
+  "safety_warnings": [],
+  "grounded": true,
+  "insufficient_evidence": true
+}
+"""
+
+
+class StructuredLLMInvestigator:
+    """
+    Production-facing structured investigation layer.
+
+    The existing LLMInvestigator remains responsible for communicating
+    with the LLM provider.
+
+    This class adds:
+      1. strict JSON response requirements
+      2. provider-level JSON schema enforcement
+      3. deterministic response parsing
+      4. response schema validation
+      5. evidence-validator integration
+      6. safe fallback when the model response cannot be validated
+
+    The LLM never becomes the source of truth.
+    """
+
+    REQUIRED_FIELDS = {
+        "status",
+        "summary",
+        "observed_facts",
+        "knowledge_context",
+        "uncertainties",
+        "evidence_gaps",
+        "next_investigation_steps",
+        "safety_warnings",
+        "grounded",
+        "insufficient_evidence",
+    }
+
+    ALLOWED_STATUSES = {
+        "investigating",
+        "insufficient_evidence",
+    }
+
+    FACT_PACKET_EVIDENCE_SECTIONS = (
+        "evidence",
+        "detections",
+        "events",
+        "behaviors",
+        "behavior_detections",
+    )
+
+    FACT_PACKET_REFERENCE_KEYS = (
+        "evidence_id",
+        "evidence_ref",
+        "detection_id",
+        "event_id",
+        "telemetry_id",
+        "behavior_detection_id",
+        "id",
+        "source_record",
+        "source_detection",
+        "source_telemetry",
+    )
+
+    @staticmethod
+    def _as_list(value: Any) -> List[Any]:
+        return value if isinstance(value, list) else []
+
+    @classmethod
+    def _string_set(cls, values: Any) -> Set[str]:
+        if isinstance(values, (str, bytes)):
+            values = [values]
+
+        if not isinstance(values, Iterable):
+            return set()
+
+        return {
+            str(value)
+            for value in values
+            if value is not None and str(value)
+        }
+
+    @classmethod
+    def _fact_packet_refs(
+        cls,
+        fact_packet: Dict[str, Any],
+    ) -> List[str]:
+        """
+        Build the exact opaque reference catalog that the deterministic
+        evidence validator is expected to understand.
+
+        The catalog is sorted so the generated prompt is deterministic.
+        """
+        refs: Set[str] = set()
+
+        for section_name in cls.FACT_PACKET_EVIDENCE_SECTIONS:
+            for item in cls._as_list(fact_packet.get(section_name)):
+                if not isinstance(item, dict):
+                    continue
+
+                for key in cls.FACT_PACKET_REFERENCE_KEYS:
+                    value = item.get(key)
+
+                    if value is not None and str(value):
+                        refs.add(str(value))
+
+                for key in (
+                    "evidence_refs",
+                    "supporting_evidence_refs",
+                ):
+                    refs.update(
+                        cls._string_set(item.get(key, []))
+                    )
+
+        return sorted(refs)
+
+    @classmethod
+    def _knowledge_refs(
+        cls,
+        retrieval_context: Any,
+    ) -> List[str]:
+        """
+        Build the exact knowledge-reference catalog available to the model.
+        """
+        if not isinstance(retrieval_context, dict):
+            return []
+
+        refs: Set[str] = set()
+
+        for section_name in (
+            "security_knowledge",
+            "sentinelmesh_knowledge",
+        ):
+            for item in cls._as_list(
+                retrieval_context.get(section_name)
+            ):
+                if not isinstance(item, dict):
+                    continue
+
+                refs.update(
+                    cls._string_set(
+                        item.get("evidence_refs", [])
+                    )
+                )
+
+                refs.update(
+                    cls._string_set(
+                        item.get("knowledge_refs", [])
+                    )
+                )
+
+                ref = item.get("ref")
+
+                if ref is not None and str(ref):
+                    refs.add(str(ref))
+
+        return sorted(refs)
+
+    @classmethod
+    def _build_reference_constraints(
+        cls,
+        fact_packet: Dict[str, Any],
+        retrieval_context: Any,
+    ) -> str:
+        """
+        Add a machine-readable reference allow-list to the model prompt.
+
+        This prevents the model from inventing semantic evidence references
+        such as event_4798, T1087, CM-001, or a hostname.
+        """
+        fact_refs = cls._fact_packet_refs(fact_packet)
+        knowledge_refs = cls._knowledge_refs(retrieval_context)
+
+        lines = [
+            "",
+            "ALLOWED REFERENCE CATALOG",
+            "=========================",
+            "",
+            "FACT PACKET REFERENCES:",
+        ]
+
+        if fact_refs:
+            lines.extend(
+                f"- {reference}"
+                for reference in fact_refs
+            )
+        else:
+            lines.append("- NONE")
+
+        lines.extend(
+            [
+                "",
+                "KNOWLEDGE REFERENCES:",
+            ]
+        )
+
+        if knowledge_refs:
+            lines.extend(
+                f"- {reference}"
+                for reference in knowledge_refs
+            )
+        else:
+            lines.append("- NONE")
+
+        lines.extend(
+            [
+                "",
+                "REFERENCE ENFORCEMENT:",
+                "- Copy reference strings exactly as listed.",
+                "- Do not generate semantic references such as "
+                "\"event_4798\", \"T1087\", \"CM-001\", or a host name "
+                "unless that exact string appears in the catalog.",
+                "- If no allowed reference supports a factual claim, omit "
+                "the claim.",
+                "- If KNOWLEDGE REFERENCES is NONE, knowledge_context MUST "
+                "be an empty list.",
+                "",
+            ]
+        )
+
+        return "\n".join(lines)
+
+    @staticmethod
+    def _format_gap_context(
+        analysis: EvidenceGapAnalysis,
+    ) -> str:
+        """
+        Attach deterministic evidence-gap analysis to the prompt.
+
+        The LLM may explain these gaps. It must not invent new ones.
+        """
+
+        lines = [
+            "",
+            "DETERMINISTIC EVIDENCE-GAP ANALYSIS",
+            "===================================",
+            "",
+            "This analysis was produced by SentinelMesh deterministic",
+            "logic. It is NOT generated by the LLM.",
+            "",
+            "visibility_score is a visibility metric, not a risk score.",
+            f"visibility_score: {analysis.visibility_score}",
+            "sufficient_for_investigation: "
+            f"{analysis.sufficient_for_investigation}",
+            "",
+            "EVIDENCE GAPS:",
+        ]
+
+        if not analysis.gaps:
+            lines.append("- NONE")
+        else:
+            for gap in analysis.gaps:
+                lines.extend(
+                    [
+                        f"- {gap.gap_id} [{gap.priority}] "
+                        f"blocking={gap.blocking}: "
+                        f"{gap.description}",
+                        f"  why_it_matters: {gap.why_it_matters}",
+                    ]
+                )
+
+        lines.extend(
+            [
+                "",
+                "GAP ENFORCEMENT:",
+                "- Copy evidence_gaps from this analysis.",
+                "- Do not invent additional evidence gaps.",
+                "- Do not convert synthetic telemetry into confirmed",
+                "  malicious activity.",
+                "- You may explain these gaps and recommend next",
+                "  investigation steps using allowed references.",
+                "",
+            ]
+        )
+
+        return "\n".join(lines)
+
+    @staticmethod
+    def _dedupe_strings(
+        values: Any,
+    ) -> List[str]:
+        seen: Set[str] = set()
+        result: List[str] = []
+
+        if not isinstance(values, list):
+            return result
+
+        for value in values:
+            if not isinstance(value, str) or not value:
+                continue
+
+            if value in seen:
+                continue
+
+            seen.add(value)
+            result.append(value)
+
+        return result
+
+    def _apply_gap_analysis(
+        self,
+        response: InvestigationResponse,
+        analysis: EvidenceGapAnalysis,
+    ) -> InvestigationResponse:
+        """
+        Keep evidence gaps deterministic after the LLM response.
+
+        Groundedness remains the validator result. Blocking gaps
+        force insufficient_evidence even if the model claimed
+        otherwise.
+        """
+
+        evidence_gaps = analysis.gap_messages()
+        safety_warnings = self._dedupe_strings(
+            response.safety_warnings
+        )
+
+        for gap in analysis.gaps:
+            if gap.gap_id == "GAP-SYNTHETIC-CONTEXT":
+                warning = (
+                    "Synthetic telemetry must not be treated "
+                    "as confirmed real-world activity."
+                )
+                if warning not in safety_warnings:
+                    safety_warnings.append(warning)
+
+        status = response.status
+        insufficient_evidence = (
+            response.insufficient_evidence
+        )
+
+        if (
+            not analysis.sufficient_for_investigation
+            and status != "validation_failed"
+        ):
+            status = "insufficient_evidence"
+            insufficient_evidence = True
+
+        return InvestigationResponse(
+            incident_id=response.incident_id,
+            status=status,
+            summary=response.summary,
+            observed_facts=response.observed_facts,
+            knowledge_context=response.knowledge_context,
+            uncertainties=response.uncertainties,
+            evidence_gaps=evidence_gaps,
+            next_investigation_steps=(
+                response.next_investigation_steps
+            ),
+            safety_warnings=safety_warnings,
+            grounded=response.grounded,
+            insufficient_evidence=insufficient_evidence,
+        )
+
+    @classmethod
+    def _response_json_schema(
+        cls,
+        fact_packet_refs: List[str] | None = None,
+        knowledge_refs: List[str] | None = None,
+    ) -> Dict[str, Any]:
+        """
+        Return the JSON Schema supplied directly to the LLM provider.
+
+        This is stronger than prompt-only JSON instructions because the
+        Ollama provider can enforce the response structure during generation.
+        """
+
+        fact_packet_refs = sorted(set(fact_packet_refs or []))
+        knowledge_refs = sorted(set(knowledge_refs or []))
+
+        evidence_ref_schema: Dict[str, Any] = {"type": "string"}
+        knowledge_ref_schema: Dict[str, Any] = {"type": "string"}
+
+        if fact_packet_refs:
+            evidence_ref_schema["enum"] = fact_packet_refs
+
+        if knowledge_refs:
+            knowledge_ref_schema["enum"] = knowledge_refs
+
+        return {
+            "type": "object",
+            "additionalProperties": False,
+            "required": [
+                "status",
+                "summary",
+                "observed_facts",
+                "knowledge_context",
+                "uncertainties",
+                "evidence_gaps",
+                "next_investigation_steps",
+                "safety_warnings",
+                "grounded",
+                "insufficient_evidence",
+            ],
+            "properties": {
+                "status": {
+                    "type": "string",
+                    "enum": [
+                        "investigating",
+                        "insufficient_evidence",
+                    ],
+                },
+                "summary": {
+                    "type": "string",
+                },
+                "observed_facts": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": [
+                            "claim",
+                            "evidence_refs",
+                            "source",
+                        ],
+                        "properties": {
+                            "claim": {
+                                "type": "string",
+                            },
+                            "evidence_refs": {
+                                "type": "array",
+                                "items": evidence_ref_schema,
+                            },
+                            "source": {
+                                "type": "string",
+                            },
+                        },
+                    },
+                },
+                "knowledge_context": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": [
+                            "statement",
+                            "knowledge_refs",
+                            "source",
+                        ],
+                        "properties": {
+                            "statement": {
+                                "type": "string",
+                            },
+                            "knowledge_refs": {
+                                "type": "array",
+                                "items": knowledge_ref_schema,
+                            },
+                            "source": {
+                                "type": "string",
+                            },
+                        },
+                    },
+                },
+                "uncertainties": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                    },
+                },
+                "evidence_gaps": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                    },
+                },
+                "next_investigation_steps": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": [
+                            "action",
+                            "rationale",
+                            "supporting_evidence_refs",
+                        ],
+                        "properties": {
+                            "action": {
+                                "type": "string",
+                            },
+                            "rationale": {
+                                "type": "string",
+                            },
+                            "supporting_evidence_refs": {
+                                "type": "array",
+                                "items": evidence_ref_schema,
+                            },
+                        },
+                    },
+                },
+                "safety_warnings": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                    },
+                },
+                "grounded": {
+                    "type": "boolean",
+                },
+                "insufficient_evidence": {
+                    "type": "boolean",
+                },
+            },
+        }
+
+    def __init__(
+        self,
+        investigator: LLMInvestigator | None = None,
+        model: str = "qwen3:8b",
+        temperature: float = 0.0,
+        max_output_tokens: int = 1200,
+    ):
+        self.investigator = investigator or LLMInvestigator(
+            model=model,
+            temperature=temperature,
+            max_output_tokens=max_output_tokens,
+        )
+
+    @staticmethod
+    def _incident_id(
+        fact_packet: Dict[str, Any],
+    ) -> str:
+        incident = fact_packet.get("incident", {})
+
+        if isinstance(incident, dict):
+            return str(
+                incident.get(
+                    "incident_id",
+                    "UNKNOWN",
+                )
+            )
+
+        return "UNKNOWN"
+
+    @staticmethod
+    def _strip_markdown_fence(
+        text: str,
+    ) -> str:
+        text = text.strip()
+
+        if text.startswith("```"):
+            text = re.sub(
+                r"^```(?:json)?\s*",
+                "",
+                text,
+                flags=re.IGNORECASE,
+            )
+
+            text = re.sub(
+                r"\s*```$",
+                "",
+                text,
+            )
+
+        return text.strip()
+
+    @classmethod
+    def _extract_json(
+        cls,
+        text: str,
+    ) -> Dict[str, Any]:
+        """
+        Extract a JSON object from the model response.
+
+        Strict JSON is expected, but this also safely handles a model
+        accidentally wrapping the JSON in a Markdown code fence.
+        """
+        cleaned = cls._strip_markdown_fence(text)
+
+        try:
+            parsed = json.loads(cleaned)
+        except json.JSONDecodeError:
+            match = re.search(
+                r"\{.*\}",
+                cleaned,
+                flags=re.DOTALL,
+            )
+
+            if not match:
+                raise ValueError(
+                    "LLM response did not contain a JSON object."
+                )
+
+            try:
+                parsed = json.loads(
+                    match.group(0)
+                )
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    "LLM response contained invalid JSON."
+                ) from exc
+
+        if not isinstance(parsed, dict):
+            raise ValueError(
+                "LLM response JSON must be an object."
+            )
+
+        return parsed
+
+    @classmethod
+    def _validate_schema(
+        cls,
+        response: Dict[str, Any],
+    ) -> None:
+        missing = (
+            cls.REQUIRED_FIELDS
+            - set(response.keys())
+        )
+
+        if missing:
+            raise ValueError(
+                "LLM response is missing required fields: "
+                + ", ".join(sorted(missing))
+            )
+
+        unexpected = (
+            set(response.keys())
+            - cls.REQUIRED_FIELDS
+        )
+
+        if unexpected:
+            raise ValueError(
+                "LLM response contains unsupported fields: "
+                + ", ".join(sorted(unexpected))
+            )
+
+        status = response.get("status")
+
+        if status not in cls.ALLOWED_STATUSES:
+            raise ValueError(
+                f"Unsupported investigation status: {status}"
+            )
+
+        if not isinstance(
+            response.get("summary"),
+            str,
+        ):
+            raise ValueError(
+                "summary must be a string."
+            )
+
+        list_fields = [
+            "observed_facts",
+            "knowledge_context",
+            "uncertainties",
+            "evidence_gaps",
+            "next_investigation_steps",
+            "safety_warnings",
+        ]
+
+        for field_name in list_fields:
+            if not isinstance(
+                response.get(field_name),
+                list,
+            ):
+                raise ValueError(
+                    f"{field_name} must be a list."
+                )
+
+        if not isinstance(
+            response.get("grounded"),
+            bool,
+        ):
+            raise ValueError(
+                "grounded must be boolean."
+            )
+
+        if not isinstance(
+            response.get("insufficient_evidence"),
+            bool,
+        ):
+            raise ValueError(
+                "insufficient_evidence must be boolean."
+            )
+
+        if (
+            status == "insufficient_evidence"
+            and not response["insufficient_evidence"]
+        ):
+            raise ValueError(
+                "insufficient_evidence must be true "
+                "when status is insufficient_evidence."
+            )
+
+        if (
+            response["insufficient_evidence"]
+            and status != "insufficient_evidence"
+        ):
+            raise ValueError(
+                "status must be insufficient_evidence "
+                "when insufficient_evidence is true."
+            )
+
+        for index, item in enumerate(
+            response["observed_facts"]
+        ):
+            if not isinstance(item, dict):
+                raise ValueError(
+                    f"observed_facts[{index}] must be an object."
+                )
+
+            required = {
+                "claim",
+                "evidence_refs",
+                "source",
+            }
+
+            if set(item.keys()) != required:
+                raise ValueError(
+                    f"observed_facts[{index}] has invalid fields."
+                )
+
+            if not isinstance(
+                item["claim"],
+                str,
+            ):
+                raise ValueError(
+                    f"observed_facts[{index}].claim "
+                    "must be a string."
+                )
+
+            if not isinstance(
+                item["evidence_refs"],
+                list,
+            ):
+                raise ValueError(
+                    f"observed_facts[{index}].evidence_refs "
+                    "must be a list."
+                )
+
+            if not isinstance(
+                item["source"],
+                str,
+            ):
+                raise ValueError(
+                    f"observed_facts[{index}].source "
+                    "must be a string."
+                )
+
+            if not item["evidence_refs"]:
+                raise ValueError(
+                    f"observed_facts[{index}] must contain "
+                    "at least one evidence reference."
+                )
+
+        for index, item in enumerate(
+            response["knowledge_context"]
+        ):
+            if not isinstance(item, dict):
+                raise ValueError(
+                    f"knowledge_context[{index}] "
+                    "must be an object."
+                )
+
+            required = {
+                "statement",
+                "knowledge_refs",
+                "source",
+            }
+
+            if set(item.keys()) != required:
+                raise ValueError(
+                    f"knowledge_context[{index}] "
+                    "has invalid fields."
+                )
+
+            if not isinstance(
+                item["statement"],
+                str,
+            ):
+                raise ValueError(
+                    f"knowledge_context[{index}].statement "
+                    "must be a string."
+                )
+
+            if not isinstance(
+                item["knowledge_refs"],
+                list,
+            ):
+                raise ValueError(
+                    f"knowledge_context[{index}].knowledge_refs "
+                    "must be a list."
+                )
+
+        for index, item in enumerate(
+            response["next_investigation_steps"]
+        ):
+            if not isinstance(item, dict):
+                raise ValueError(
+                    f"next_investigation_steps[{index}] "
+                    "must be an object."
+                )
+
+            required = {
+                "action",
+                "rationale",
+                "supporting_evidence_refs",
+            }
+
+            if set(item.keys()) != required:
+                raise ValueError(
+                    f"next_investigation_steps[{index}] "
+                    "has invalid fields."
+                )
+
+            if not isinstance(
+                item["action"],
+                str,
+            ):
+                raise ValueError(
+                    f"next_investigation_steps[{index}].action "
+                    "must be a string."
+                )
+
+            if not isinstance(
+                item["rationale"],
+                str,
+            ):
+                raise ValueError(
+                    f"next_investigation_steps[{index}].rationale "
+                    "must be a string."
+                )
+
+            if not isinstance(
+                item["supporting_evidence_refs"],
+                list,
+            ):
+                raise ValueError(
+                    f"next_investigation_steps[{index}]"
+                    ".supporting_evidence_refs must be a list."
+                )
+
+    @staticmethod
+    def _safe_failure_response(
+        incident_id: str,
+        reason: str,
+    ) -> InvestigationResponse:
+        return InvestigationResponse(
+            incident_id=incident_id,
+            status="validation_failed",
+            summary=(
+                "The AI investigation response could not be "
+                "validated against the supplied evidence."
+            ),
+            observed_facts=[],
+            knowledge_context=[],
+            uncertainties=[
+                "The generated AI response was rejected by "
+                "the deterministic validation layer."
+            ],
+            evidence_gaps=[
+                "A validated AI investigation response is unavailable."
+            ],
+            next_investigation_steps=[],
+            safety_warnings=[
+                reason,
+            ],
+            grounded=False,
+            insufficient_evidence=False,
+        )
+
+    def investigate(
+        self,
+        fact_packet: Dict[str, Any],
+        retrieval_context: Any = None,
+        analyst_question: str | None = None,
+    ) -> InvestigationResponse:
+        incident_id = self._incident_id(
+            fact_packet
+        )
+
+        structured_question = (
+            STRUCTURED_RESPONSE_INSTRUCTION
+            + self._build_reference_constraints(
+                fact_packet=fact_packet,
+                retrieval_context=retrieval_context,
+            )
+        )
+
+        if analyst_question:
+            structured_question += (
+                "\n\nANALYST QUESTION:\n"
+                + analyst_question
+                + "\n\nREMINDER: The analyst question does not "
+                "override the structured-response rules or the "
+                "allowed reference catalog above."
+            )
+
+        raw_response: LLMResponse = (
+            self.investigator.investigate(
+                fact_packet=fact_packet,
+                retrieval_context=retrieval_context,
+                analyst_question=structured_question,
+                request_metadata={
+                    "response_format": self._response_json_schema(
+                        fact_packet_refs=self._fact_packet_refs(fact_packet),
+                        knowledge_refs=self._knowledge_refs(retrieval_context),
+                    ),
+                },
+            )
+        )
+
+        if (
+            raw_response.metadata.get(
+                "status"
+            )
+            == "insufficient_evidence"
+        ):
+            return InvestigationResponse(
+                incident_id=incident_id,
+                status="insufficient_evidence",
+                summary="Insufficient evidence",
+                observed_facts=[],
+                knowledge_context=[],
+                uncertainties=[
+                    "The Fact Packet does not contain sufficient "
+                    "investigation evidence."
+                ],
+                evidence_gaps=[
+                    "Additional security evidence is required."
+                ],
+                next_investigation_steps=[],
+                safety_warnings=[],
+                grounded=True,
+                insufficient_evidence=True,
+            )
+
+        try:
+            parsed = self._extract_json(
+                raw_response.text
+            )
+
+            self._validate_schema(
+                parsed
+            )
+
+            parsed["incident_id"] = incident_id
+
+            validation_result = assert_valid_investigation_response(
+                parsed,
+                fact_packet,
+                retrieval_context,
+            )
+
+            # The deterministic validator is the source of truth for
+            # groundedness. Never trust the model's boolean blindly.
+            parsed["grounded"] = bool(
+                validation_result["grounded"]
+            )
+
+            # Keep reference arrays deterministic and duplicate-free.
+            for item in parsed.get("observed_facts", []):
+                item["evidence_refs"] = list(
+                    dict.fromkeys(item.get("evidence_refs", []))
+                )
+
+            for item in parsed.get("knowledge_context", []):
+                item["knowledge_refs"] = list(
+                    dict.fromkeys(item.get("knowledge_refs", []))
+                )
+
+            for item in parsed.get("next_investigation_steps", []):
+                item["supporting_evidence_refs"] = list(
+                    dict.fromkeys(
+                        item.get("supporting_evidence_refs", [])
+                    )
+                )
+
+        except Exception as exc:
+            return self._safe_failure_response(
+                incident_id=incident_id,
+                reason=str(exc),
+            )
+
+        return InvestigationResponse(
+            incident_id=incident_id,
+            status=parsed["status"],
+            summary=parsed["summary"],
+            observed_facts=parsed["observed_facts"],
+            knowledge_context=parsed["knowledge_context"],
+            uncertainties=parsed["uncertainties"],
+            evidence_gaps=parsed["evidence_gaps"],
+            next_investigation_steps=(
+                parsed["next_investigation_steps"]
+            ),
+            safety_warnings=parsed["safety_warnings"],
+            grounded=parsed["grounded"],
+            insufficient_evidence=(
+                parsed["insufficient_evidence"]
+            ),
+        )
+
+
+def investigate_with_structured_ollama(
+    fact_packet: Dict[str, Any],
+    retrieval_context: Any = None,
+    analyst_question: str | None = None,
+) -> InvestigationResponse:
+    investigator = StructuredLLMInvestigator(
+        model="qwen3:8b",
+        temperature=0.0,
+        max_output_tokens=1200,
+    )
+
+    return investigator.investigate(
+        fact_packet=fact_packet,
+        retrieval_context=retrieval_context,
+        analyst_question=analyst_question,
+    )
+
+
+__all__ = [
+    "StructuredLLMInvestigator",
+    "investigate_with_structured_ollama",
+]
