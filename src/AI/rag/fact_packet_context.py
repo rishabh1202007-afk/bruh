@@ -310,6 +310,9 @@ def _extract_behavior_queries(
         if not isinstance(behavior, dict):
             continue
 
+        if behavior.get("synthetic") is True:
+            _add_query(queries, seen, "synthetic telemetry policy")
+
         behavior_type = _string(
             behavior.get("behavior_type")
         )

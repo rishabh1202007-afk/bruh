@@ -6,6 +6,7 @@ from typing import Any, Dict, Iterable, List, Set
 
 from ..fact_packet.builder import canonical_mitre_techniques
 from .attack_sequence import reconstruct_attack_sequence
+from .counterfactual_engine import run_counterfactual_investigation
 from .evidence_gap_engine import analyze_evidence_gaps
 from .historical_comparison import compare_historical_incidents
 from .guardrails import (
@@ -781,6 +782,8 @@ class InvestigationAgent:
         include_attack_sequence: bool = False,
         graph: Any = None,
         include_risk_explanation: bool = False,
+        include_counterfactuals: bool = False,
+        counterfactual_questions: List[str] | None = None,
     ) -> InvestigationResponse:
         """
         Investigate one canonical SentinelMesh Fact Packet.
@@ -828,6 +831,14 @@ class InvestigationAgent:
             include_risk_explanation,
         )
 
+        counterfactual_investigation = (
+            self._build_counterfactual_investigation(
+                fact_packet,
+                include_counterfactuals,
+                counterfactual_questions,
+            )
+        )
+
         if not guardrail_result[
             "safe_to_investigate"
         ]:
@@ -847,6 +858,7 @@ class InvestigationAgent:
                 historical_comparison=historical_comparison,
                 attack_sequence=attack_sequence,
                 risk_explanation=risk_explanation,
+                counterfactual_investigation=counterfactual_investigation,
             )
 
         # ---------------------------------------------------------
@@ -891,6 +903,7 @@ class InvestigationAgent:
                 historical_comparison=historical_comparison,
                 attack_sequence=attack_sequence,
                 risk_explanation=risk_explanation,
+                counterfactual_investigation=counterfactual_investigation,
             )
 
         observed = _observed_facts(
@@ -962,6 +975,7 @@ class InvestigationAgent:
             historical_comparison=historical_comparison,
             attack_sequence=attack_sequence,
             risk_explanation=risk_explanation,
+            counterfactual_investigation=counterfactual_investigation,
         )
 
         grounding_warnings = (
@@ -1093,6 +1107,38 @@ class InvestigationAgent:
                     "Historical comparison was unavailable; the "
                     "normal investigation result was preserved."
                 ],
+                "insufficient_evidence": True,
+            }
+
+    @staticmethod
+    def _build_counterfactual_investigation(
+        fact_packet: Dict[str, Any],
+        include_counterfactuals: bool,
+        counterfactual_questions: List[str] | None,
+    ) -> Dict[str, Any] | None:
+        """Run optional counterfactual scenario analysis safely."""
+
+        if not include_counterfactuals:
+            return None
+
+        try:
+            return run_counterfactual_investigation(
+                fact_packet=fact_packet,
+                questions=counterfactual_questions,
+            ).to_dict()
+        except Exception:
+            return {
+                "incident_id": str(
+                    fact_packet.get("incident", {}).get("incident_id", "")
+                    if isinstance(fact_packet.get("incident"), dict)
+                    else ""
+                ),
+                "status": "insufficient_evidence",
+                "scenarios": [],
+                "limitations": [
+                    "Counterfactual analysis was unavailable; normal investigation result preserved."
+                ],
+                "grounded": True,
                 "insufficient_evidence": True,
             }
 
@@ -1247,6 +1293,8 @@ def investigate(
     include_attack_sequence: bool = False,
     graph: Any = None,
     include_risk_explanation: bool = False,
+    include_counterfactuals: bool = False,
+    counterfactual_questions: List[str] | None = None,
 ) -> InvestigationResponse:
     """
     Convenience function for the SentinelMesh AI investigation API.
@@ -1260,6 +1308,8 @@ def investigate(
         include_attack_sequence=include_attack_sequence,
         graph=graph,
         include_risk_explanation=include_risk_explanation,
+        include_counterfactuals=include_counterfactuals,
+        counterfactual_questions=counterfactual_questions,
     )
 
 

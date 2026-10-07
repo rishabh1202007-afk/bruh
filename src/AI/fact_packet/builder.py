@@ -30,11 +30,12 @@ def build_fact_packet(
     evidence = evidence or []
     behavior_detections = behavior_detections or []
 
-    risk_scoring = (
-        risk.get("risk_scoring", risk)
-        if risk
-        else {}
-    )
+    # Extract risk_scoring from explicit parameter or from incident
+    if risk:
+        risk_scoring = risk.get("risk_scoring", risk) if isinstance(risk, dict) else risk
+    else:
+        # Fallback to incident's risk_scoring if present
+        risk_scoring = incident.get("risk_scoring", {})
 
     packet = {
         "incident": _build_incident(incident),

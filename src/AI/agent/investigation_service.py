@@ -9,6 +9,8 @@ from ..rag.fact_packet_context import RAGContext, build_rag_context
 from .investigation_agent import InvestigationResponse
 from .structured_llm_investigator import StructuredLLMInvestigator
 from .attack_sequence import reconstruct_attack_sequence
+from .counterfactual_engine import run_counterfactual_investigation
+from .feedback_store import AnalystFeedback, FeedbackStore
 from .historical_comparison import compare_historical_incidents
 from .risk_explanation import explain_risk_score
 from .llm_risk_explanation import LLMRiskExplainer
@@ -41,6 +43,7 @@ class SentinelMeshInvestigationService:
         if rag_top_k <= 0:
             raise ValueError("rag_top_k must be greater than zero.")
         self.rag_top_k = rag_top_k
+        self.feedback_store = FeedbackStore()
 
     def build_fact_packet(self, incident: Dict[str, Any]) -> Dict[str, Any]:
         # Minimalist implementation for this fix, assuming correct logic previously
@@ -53,6 +56,8 @@ class SentinelMeshInvestigationService:
         retrieval_context: Any = None,
         analyst_question: str | None = None,
         historical_incidents: List[Dict[str, Any]] | None = None,
+        include_counterfactuals: bool = False,
+        counterfactual_questions: List[str] | None = None,
     ) -> InvestigationResponse:
         fact_packet = self.build_fact_packet(incident)
         # Using service rag builder if needed, but for now simple delegation
@@ -94,6 +99,17 @@ class SentinelMeshInvestigationService:
         except Exception:
             mitre_investigation = None
 
+        # Counterfactual Investigation
+        if include_counterfactuals:
+            try:
+                counterfactual_investigation = run_counterfactual_investigation(
+                    fact_packet, questions=counterfactual_questions
+                ).to_dict()
+            except Exception:
+                counterfactual_investigation = None
+        else:
+            counterfactual_investigation = None
+
         # Structured LLM Investigator
         response = self.investigator.investigate(
             fact_packet=fact_packet,
@@ -106,5 +122,35 @@ class SentinelMeshInvestigationService:
         response.attack_sequence = attack_seq
         response.historical_comparison = comparison
         response.mitre_investigation = mitre_investigation
+        response.counterfactual_investigation = counterfactual_investigation
 
         return response
+
+    def submit_feedback(
+        self,
+        feedback_data: Dict[str, Any] | AnalystFeedback,
+        fact_packet: Dict[str, Any] | None = None,
+        response: Any = None,
+    ) -> Dict[str, Any]:
+        """
+        Submit structured analyst feedback. Returns dictionary representation of stored feedback.
+        """
+        feedback_obj = self.feedback_store.add_feedback(
+            feedback=feedback_data,
+            fact_packet=fact_packet,
+            response=response,
+        )
+        return feedback_obj.to_dict()
+
+    def get_feedback(self, feedback_id: str) -> Dict[str, Any] | None:
+        """
+        Retrieve feedback by ID.
+        """
+        fb = self.feedback_store.get_feedback(feedback_id)
+        return fb.to_dict() if fb else None
+
+    def list_feedback_for_incident(self, incident_id: str) -> List[Dict[str, Any]]:
+        """
+        List all feedback records for a given incident ID.
+        """
+        return [fb.to_dict() for fb in self.feedback_store.list_feedback_for_incident(incident_id)]
